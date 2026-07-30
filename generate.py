@@ -126,10 +126,15 @@ def generate(args):
         prompt_tensor = torch.tensor(prompt_ids, dtype=torch.long).unsqueeze(0).to(device)
         _, hidden = model(prompt_tensor)
 
+    # Clip context to the window the model was trained on.  For the Transformer
+    # this must not exceed model.context_len (the PE buffer size); for the LSTM
+    # it doesn't matter since hidden state is carried explicitly.
+    ctx_len = getattr(model, "context_len", args.context_len)
+
     for step in range(args.max_tokens):
-        # For Transformer, feed the last context_len tokens
+        # For Transformer, feed the last ctx_len tokens
         if args.model == "transformer":
-            ctx = generated[-args.context_len:]
+            ctx = generated[-ctx_len:]
             x = torch.tensor(ctx, dtype=torch.long).unsqueeze(0).to(device)
             logits = model(x)  # (1, T, V)
             next_logits = logits[0, -1, :]  # (V,)
@@ -141,6 +146,8 @@ def generate(args):
 
         # Mask PAD so we never generate it
         next_logits[pad_id] = float("-inf")
+        if args.suppress_eos:
+            next_logits[eos_id] = float("-inf")
 
         next_id = sample_next_token(next_logits, args.temperature, args.top_k)
         generated.append(next_id)
@@ -180,6 +187,8 @@ def parse_args():
     p.add_argument("--context_len", type=int, default=512)
     p.add_argument("--temperature", type=float, default=1.0)
     p.add_argument("--top_k", type=int, default=40, help="0 = no top-k filtering.")
+    p.add_argument("--suppress_eos", action="store_true",
+                   help="Mask the EOS token so generation always runs to max_tokens (avoids early stops).")
     return p.parse_args()
 
 

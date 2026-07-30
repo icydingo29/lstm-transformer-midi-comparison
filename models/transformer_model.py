@@ -7,7 +7,7 @@ Architecture:
     → Linear(256, vocab_size)
 
 FFN dimension is tuned to match the LSTM parameter count (≈4M) within ±10%.
-The default ffn_dim=1024 gives ≈3.8M parameters with vocab_size=532 — within
+With vocab_size=532, ffn_dim=1280 gives ≈3.8M parameters (ratio 0.934) — within
 ±10% of the LSTM's ≈4M. Adjust ffn_dim in build_transformer() if needed.
 
 Exact parameter counts are printed at construction so they can be compared
@@ -44,7 +44,7 @@ class SinusoidalPositionalEncoding(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: (B, T, embed_dim)
-        x = x + self.pe[:, : x.size(1), :]
+        x = x + self.pe[:, : x.size(1), :] # type:ignore
         return self.dropout(x)
 
 
@@ -58,11 +58,10 @@ class CausalSelfAttention(nn.Module):
         assert embed_dim % num_heads == 0
         self.num_heads = num_heads
         self.head_dim = embed_dim // num_heads
-        self.scale = self.head_dim ** -0.5
+        self.dropout_p = dropout
 
         self.qkv = nn.Linear(embed_dim, 3 * embed_dim, bias=False)
         self.proj = nn.Linear(embed_dim, embed_dim)
-        self.attn_drop = nn.Dropout(dropout)
         self.resid_drop = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -71,16 +70,13 @@ class CausalSelfAttention(nn.Module):
         qkv = qkv.permute(2, 0, 3, 1, 4)   # (3, B, H, T, head_dim)
         q, k, v = qkv[0], qkv[1], qkv[2]
 
-        # Scaled dot-product attention with causal mask
-        attn = (q @ k.transpose(-2, -1)) * self.scale   # (B, H, T, T)
-        causal_mask = torch.triu(
-            torch.ones(T, T, device=x.device, dtype=torch.bool), diagonal=1
-        )
-        attn = attn.masked_fill(causal_mask, float("-inf"))
-        attn = F.softmax(attn, dim=-1)
-        attn = self.attn_drop(attn)
+        # Causal scaled dot-product attention (flash-attention when available).
+        # is_causal=True applies the upper-triangular mask internally — no need
+        # to allocate a (T, T) mask tensor on every forward pass.
+        attn_dropout = self.dropout_p if self.training else 0.0
+        out = F.scaled_dot_product_attention(q, k, v, dropout_p=attn_dropout, is_causal=True)
 
-        out = (attn @ v).transpose(1, 2).reshape(B, T, C)
+        out = out.transpose(1, 2).reshape(B, T, C)
         return self.resid_drop(self.proj(out))
 
 

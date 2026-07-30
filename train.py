@@ -109,8 +109,8 @@ def train(args):
     log.info(f"Tokenizer: {args.tokenizer} | vocab_size={vocab_size} | pad_id={pad_id}")
 
     # Data
-    splits_dir = PROJECT_ROOT / "data" / "splits"
-    tokenized_dir = PROJECT_ROOT / "data" / "tokenized" / args.tokenizer
+    splits_dir = Path(args.splits_dir) if args.splits_dir else PROJECT_ROOT / "data" / "splits"
+    tokenized_dir = Path(args.tokenized_dir) if args.tokenized_dir else PROJECT_ROOT / "data" / "tokenized" / args.tokenizer
 
     train_ds = MusicTokenDataset(
         split_json=splits_dir / "train.json",
@@ -173,10 +173,13 @@ def train(args):
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
         start_epoch = ckpt["epoch"] + 1
         best_val_loss = ckpt.get("best_val_loss", float("inf"))
-        # Restore scheduler step count
-        trained_steps = start_epoch * len(train_loader)
-        for _ in range(trained_steps):
-            scheduler.step()
+        # Restore scheduler state; fall back to step-replay for old checkpoints
+        if "scheduler_state_dict" in ckpt:
+            scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+        else:
+            trained_steps = start_epoch * len(train_loader)
+            for _ in range(trained_steps):
+                scheduler.step()
         log.info(f"Resumed at epoch {start_epoch} | best_val_loss={best_val_loss:.4f}")
 
     # Training
@@ -238,21 +241,24 @@ def train(args):
             f"time={elapsed:.0f}s"
         )
 
-        # Save checkpoint
+        # Build state dict every epoch (cheap); used for both periodic and best saves
+        state = {
+            "epoch": epoch,
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "scheduler_state_dict": scheduler.state_dict(),
+            "loss": val_loss,
+            "best_val_loss": best_val_loss,
+            "args": vars(args),
+        }
+
         if (epoch + 1) % args.checkpoint_every == 0:
-            state = {
-                "epoch": epoch,
-                "model_state_dict": model.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "loss": val_loss,
-                "best_val_loss": best_val_loss,
-                "args": vars(args),
-            }
             torch.save(state, ckpt_path)
             log.info(f"Checkpoint saved → {ckpt_path}")
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
+            state["best_val_loss"] = best_val_loss  # keep in sync
             best_path = ckpt_dir / f"{run_name}_best.pt"
             torch.save(state, best_path)
             log.info(f"New best val_loss={best_val_loss:.4f} → {best_path}")
@@ -278,6 +284,10 @@ def parse_args():
     p.add_argument("--seed", type=int, default=DEFAULTS["seed"])
     p.add_argument("--checkpoint_every", type=int, default=DEFAULTS["checkpoint_every"])
     p.add_argument("--reset", action="store_true", help="Ignore existing checkpoint and start fresh.")
+    p.add_argument("--tokenized_dir", default=None,
+                   help="Path to tokenized .pt files. Defaults to data/tokenized/<tokenizer>/.")
+    p.add_argument("--splits_dir", default=None,
+                   help="Path to split JSON files. Defaults to data/splits/.")
     return p.parse_args()
 
 

@@ -86,8 +86,8 @@ def evaluate(args):
 
     model = load_model(args.checkpoint, args.model, vocab_size, pad_id, device)
 
-    splits_dir = PROJECT_ROOT / "data" / "splits"
-    tokenized_dir = PROJECT_ROOT / "data" / "tokenized" / args.tokenizer
+    splits_dir = Path(args.splits_dir) if args.splits_dir else PROJECT_ROOT / "data" / "splits"
+    tokenized_dir = Path(args.tokenized_dir) if args.tokenized_dir else PROJECT_ROOT / "data" / "tokenized" / args.tokenizer
 
     test_ds = MusicTokenDataset(
         split_json=splits_dir / "test.json",
@@ -128,51 +128,41 @@ def evaluate(args):
         # logits: (B, T, V)
 
         B, T, V = logits.shape
+        mask = (y != pad_id)  # (B, T) — True for real (non-PAD) tokens
 
-        # --- Cross-entropy (token level, ignoring PAD) ---
-        log_probs = F.log_softmax(logits, dim=-1)   # (B, T, V)
-        mask = (y != pad_id)                         # (B, T)
+        # --- Per-token NLL (vectorized) ---
+        log_probs = F.log_softmax(logits, dim=-1)          # (B, T, V)
+        target_lp = log_probs.gather(2, y.unsqueeze(2)).squeeze(2)  # (B, T)
+        nll = -target_lp                                   # (B, T), positive
+        nll_masked = nll * mask.float()                    # zero PAD positions
 
+        total_loss   += nll_masked.sum().item()
+        total_tokens += mask.sum().item()
+
+        # --- Top-1 / Top-5 (vectorized) ---
+        top5_preds = logits.topk(5, dim=-1).indices        # (B, T, 5)
+        y_exp = y.unsqueeze(2)                             # (B, T, 1)
+        top1_correct += ((top5_preds[:, :, :1] == y_exp).squeeze(2) & mask).sum().item()
+        top5_correct += ((top5_preds == y_exp).any(dim=-1) & mask).sum().item()
+
+        # --- Per-position buckets (vectorized) ---
+        for bucket in POSITION_BUCKETS:
+            lo, hi = bucket
+            pos_stats[bucket][0] += nll_masked[:, lo:hi].sum().item()
+            pos_stats[bucket][1] += mask[:, lo:hi].sum().item()
+
+        # --- Bits (log2) ---
+        total_bits += (nll_masked.sum() / math.log(2)).item()
+
+        # --- Duration: must stay per-sequence (tokenizer is Python) ---
         for b in range(B):
-            for t in range(T):
-                if not mask[b, t]:
-                    continue
-                target = y[b, t].item()
-                lp = log_probs[b, t, target].item()
-                nll = -lp
-                total_loss += nll
-                total_tokens += 1
+            total_duration_s += tokenizer.duration_seconds(x[b].tolist())
 
-                # Top-1 / Top-5
-                top5 = logits[b, t].topk(5).indices.tolist()
-                if top5[0] == target:
-                    top1_correct += 1
-                if target in top5:
-                    top5_correct += 1
-
-                # Per-position
-                for bucket in POSITION_BUCKETS:
-                    lo, hi = bucket
-                    if lo <= t < hi:
-                        pos_stats[bucket][0] += nll
-                        pos_stats[bucket][1] += 1
-
-                # Bits (log_2 instead of log_e) — for bits/second
-                bits = nll / math.log(2)
-                total_bits += bits
-
-        # Bits/second: compute duration for each sequence in batch
+        # --- DSR: validate model's greedy (teacher-forced) predictions ---
+        pred_ids_batch = logits.argmax(dim=-1)  # (B, T)
         for b in range(B):
-            seq_ids = x[b].tolist()
-            dur = tokenizer.duration_seconds(seq_ids)
-            total_duration_s += dur
-
-        # DSR: validate each sequence's target tokens (as produced by the model)
-        # We evaluate the ground-truth y sequences for structural validity
-        for b in range(B):
-            seq_ids = y[b].tolist()
             n_total += 1
-            is_valid, _ = tokenizer.validate_decode(seq_ids)
+            is_valid, _ = tokenizer.validate_decode(pred_ids_batch[b].tolist())
             if is_valid:
                 n_valid += 1
 
@@ -239,6 +229,10 @@ def parse_args():
     p.add_argument("--tokenizer", choices=["event", "remi"], required=True)
     p.add_argument("--context_len", type=int, default=512)
     p.add_argument("--batch_size", type=int, default=16)
+    p.add_argument("--tokenized_dir", default=None,
+                   help="Path to tokenized .pt files. Defaults to data/tokenized/<tokenizer>/.")
+    p.add_argument("--splits_dir", default=None,
+                   help="Path to split JSON files. Defaults to data/splits/.")
     return p.parse_args()
 
 

@@ -116,7 +116,12 @@ class REMIWrapper:
         Returns an empty Score on failure.
         """
         from miditok import TokSequence
-        seq = TokSequence(ids=token_ids, are_ids_encoded=True)
+        # are_ids_encoded must reflect whether the ids went through a trained
+        # BPE/Unigram model. This tokenizer is not trained (is_trained == False),
+        # so the ids are raw token ids; passing are_ids_encoded=True makes MidiTok
+        # try to map them through a non-existent BPE model (self._model is None)
+        # and crash, yielding an empty Score.
+        seq = TokSequence(ids=token_ids, are_ids_encoded=self._tok.is_trained)
         try:
             score = self._tok(seq)
         except Exception:
@@ -141,8 +146,8 @@ class REMIWrapper:
                 tpq = score.ticks_per_quarter
                 # Use 120 BPM as default if no tempo track
                 if score.tempos:
-                    tempo_us = score.tempos[0].qpm  # MidiTok uses qpm (quarter per minute)
-                    secs_per_tick = 60.0 / (tempo_us * tpq)
+                    tempo_qpm = score.tempos[0].qpm  # quarter notes per minute (BPM)
+                    secs_per_tick = 60.0 / (tempo_qpm * tpq)
                 else:
                     secs_per_tick = 60.0 / (120 * tpq)
                 return end_tick * secs_per_tick

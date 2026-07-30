@@ -1,0 +1,26 @@
+# Dependencies for the LSTM-vs-Transformer music modeling project.
+#
+# torch is pinned to the CUDA 12.4 build; the --extra-index-url lets
+# `pip install -r requirements.txt` pull that wheel from the PyTorch index
+# while everything else resolves from PyPI. For a CPU-only box, drop the
+# "+cu124" suffix and the --extra-index-url line.
+#
+#   python -m venv venv
+#   venv\Scripts\python -m pip install -U pip
+#   venv\Scripts\python -m pip install -r requirements.txt
+
+--extra-index-url https://download.pytorch.org/whl/cu124
+
+torch==2.6.0+cu124
+
+# Tokenization / MIDI I/O (imported directly by the project)
+mido==1.3.3
+symusic==0.6.0
+miditok==3.0.6.post1
+
+# Pulled in transitively, pinned for reproducibility:
+#   numpy      — torch/symusic numerics
+#   tokenizers — HuggingFace lib; miditok does `from tokenizers import AddedToken`,
+#                and the local tokenizers/ package re-exports it
+numpy==2.4.6
+tokenizers==0.23.1

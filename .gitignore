@@ -239,3 +239,12 @@ checkpoints/
 
 temp
 .claude
+CLAUDE.md
+.vscode/
+generated/
+
+# Informal listening-assessment working notes (not part of the tracked paper/code)
+raw_listening_assessment.md
+
+# Non-anonymous paper (contains real names and faculty numbers)
+3MI3400841_9MI3400791_LSTM_versus_Transformer_for_Symbolic_Music.pdf

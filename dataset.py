@@ -82,7 +82,7 @@ class MusicTokenDataset(Dataset):
 
     @staticmethod
     def _tensor_length(pt_path: Path) -> int:
-        """Read tensor length without loading all data (uses storage metadata)."""
+        """Load the tensor and return its length. Result is cached in _windows at init time."""
         t = torch.load(pt_path, weights_only=True)
         return len(t)
 

@@ -68,8 +68,8 @@ class LSTMModel(nn.Module):
         emb = self.dropout(self.embedding(x))           # (B, T, embed_dim)
         out, hidden = self.lstm(emb, hidden)            # (B, T, hidden_dim)
         out = self.dropout(out)
-        logits = self.head(out)                         # (B, T, vocab_size)
-        return logits, hidden
+        logits = self.head(out)                         # (B, T, vocab_size) 
+        return logits, hidden                           # type: ignore
 
     def init_hidden(self, batch_size: int, device: torch.device):
         """Return a zeroed initial hidden state."""

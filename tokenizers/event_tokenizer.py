@@ -120,6 +120,11 @@ def _ms_to_time_shifts(ms: float) -> List[int]:
     return tokens
 
 
+def _q_ms(ms: float) -> float:
+    """Round a millisecond timestamp to the nearest TIME_STEP_MS (10 ms) grid point."""
+    return round(ms / TIME_STEP_MS) * TIME_STEP_MS
+
+
 # ---------------------------------------------------------------------------
 # Main encoder
 # ---------------------------------------------------------------------------
@@ -167,7 +172,7 @@ def encode(midi_path: str | Path) -> List[int]:
             time_sig_events.append((abs_ms, msg.numerator, msg.denominator))
         elif msg.type in ("note_on", "note_off"):
             ch = msg.channel
-            pitch = msg.pitch
+            pitch = msg.note      # mido uses .note, not .pitch
             vel = msg.velocity if hasattr(msg, "velocity") else 0
             is_drum = (ch == DRUM_CHANNEL)
 
@@ -212,14 +217,15 @@ def encode(midi_path: str | Path) -> List[int]:
     #   - TEMPO tokens on tempo changes
     #   - NOTE_ON / NOTE_OFF / DRUM_ON with VELOCITY / PROGRAM prefix
 
-    # Sort raw_events by (abs_ms, event ordering priority)
+    # Sort by (quantized 10ms slot, event priority, pitch) so events that fall
+    # in the same slot are grouped deterministically regardless of sub-10ms jitter.
     def _event_sort_key(ev):
-        t = ev[0]
+        t_q = _q_ms(ev[0])
         kind = ev[1]
         pitch = ev[2]
-        # At same time: note_on < drum_on < note_off (so we match OFF after ON)
+        # Within same slot: note_on < drum_on < note_off
         priority = {"note_on": 0, "drum_on": 1, "note_off": 2}[kind]
-        return (t, priority, pitch)
+        return (t_q, priority, pitch)
 
     raw_events.sort(key=_event_sort_key)
 
@@ -230,34 +236,43 @@ def encode(midi_path: str | Path) -> List[int]:
     next_bar = next(bar_iter, math.inf)
     next_tempo_ms, next_tempo_us = next(tempo_iter, (math.inf, 0))
 
+    # current_ms is always kept at a quantized (10 ms) grid point so that
+    # TIME_SHIFT gaps are always exact multiples of TIME_STEP_MS.
     current_ms = 0.0
     current_program_bin = -1  # force PROGRAM emit on first note
+    open_pitches: set[int] = set()  # track open notes to skip orphan NOTE_OFFs
 
     for ev in raw_events:
-        ev_ms = ev[0]
+        ev_ms_real = ev[0]                 # real timestamp (for checkpoint detection)
+        ev_ms_q   = _q_ms(ev_ms_real)     # quantized slot (for TIME_SHIFT emission)
 
-        # Drain checkpoints that fall before this event
-        while next_bar <= ev_ms or next_tempo_ms <= ev_ms:
-            checkpoint_ms = min(next_bar, next_tempo_ms)
+        # Drain checkpoints whose real time falls before this event's real time
+        while next_bar <= ev_ms_real or next_tempo_ms <= ev_ms_real:
+            checkpoint_ms   = min(next_bar, next_tempo_ms)
+            checkpoint_ms_q = _q_ms(checkpoint_ms)
 
-            # Emit TIME_SHIFT up to checkpoint
-            gap = checkpoint_ms - current_ms
-            tokens.extend(_ms_to_time_shifts(gap))
-            current_ms = checkpoint_ms
+            # Advance current position to the quantized checkpoint (no extra
+            # TIME_SHIFT if the checkpoint falls in the same slot as current_ms)
+            gap = checkpoint_ms_q - current_ms
+            if gap > 0:
+                tokens.extend(_ms_to_time_shifts(gap))
+                current_ms = checkpoint_ms_q
 
-            if next_bar <= ev_ms and next_bar == checkpoint_ms:
+            if next_bar <= ev_ms_real and next_bar == checkpoint_ms:
                 tokens.append(VOCAB["BAR"])
                 next_bar = next(bar_iter, math.inf)
 
-            if next_tempo_ms <= ev_ms and next_tempo_ms == checkpoint_ms:
+            if next_tempo_ms <= ev_ms_real and next_tempo_ms == checkpoint_ms:
                 bpm = _microseconds_to_bpm(next_tempo_us)
                 tokens.append(VOCAB[f"TEMPO_{_bpm_to_bin(bpm)}"])
                 next_tempo_ms, next_tempo_us = next(tempo_iter, (math.inf, 0))
 
-        # Emit TIME_SHIFT up to this event
-        gap = ev_ms - current_ms
-        tokens.extend(_ms_to_time_shifts(gap))
-        current_ms = ev_ms
+        # Advance to this event's quantized slot; events in the same 10 ms slot
+        # share the same current_ms so no TIME_SHIFT is emitted between them.
+        gap = ev_ms_q - current_ms
+        if gap > 0:
+            tokens.extend(_ms_to_time_shifts(gap))
+            current_ms = ev_ms_q
 
         kind = ev[1]
         if kind == "note_on":
@@ -268,13 +283,18 @@ def encode(midi_path: str | Path) -> List[int]:
                 current_program_bin = prog_bin
             tokens.append(VOCAB[f"VELOCITY_{_velocity_to_bin(vel)}"])
             tokens.append(VOCAB[f"NOTE_ON_{pitch}"])
+            open_pitches.add(pitch)
         elif kind == "drum_on":
             _, _, pitch, vel = ev
             tokens.append(VOCAB[f"VELOCITY_{_velocity_to_bin(vel)}"])
             tokens.append(VOCAB[f"DRUM_ON_{pitch}"])
         elif kind == "note_off":
             _, _, pitch = ev
-            tokens.append(VOCAB[f"NOTE_OFF_{pitch}"])
+            # Skip orphan note-offs (notes that were never opened, e.g. held
+            # across the start of the file). Silently drop, like sustain pedal.
+            if pitch in open_pitches:
+                tokens.append(VOCAB[f"NOTE_OFF_{pitch}"])
+                open_pitches.discard(pitch)
 
     tokens.append(VOCAB["EOS"])
     return tokens
@@ -350,6 +370,7 @@ def decode(token_ids: List[int], ticks_per_beat: int = 480) -> mido.MidiFile:
     # State
     current_ms = 0.0
     current_program = 0
+    current_velocity = 64  # updated whenever a VELOCITY_ token is encountered
     # pitch → onset_ms
     open_notes: dict[int, float] = {}
 
@@ -369,7 +390,8 @@ def decode(token_ids: List[int], ticks_per_beat: int = 480) -> mido.MidiFile:
         elif tok.startswith("TEMPO_"):
             pass  # tempo info used during encode; ignored in basic decode
         elif tok.startswith("VELOCITY_"):
-            pass  # velocity is picked up when NOTE_ON/DRUM_ON follows
+            bin_idx = int(tok.split("_")[1])
+            current_velocity = _bin_to_velocity(bin_idx)
         elif tok.startswith("PROGRAM_"):
             bin_idx = int(tok.split("_")[1])
             current_program = _bin_to_program(bin_idx)
@@ -382,14 +404,14 @@ def decode(token_ids: List[int], ticks_per_beat: int = 480) -> mido.MidiFile:
             open_notes[pitch] = current_ms
             events.append((
                 current_ms,
-                mido.Message("note_on", channel=0, pitch=pitch, velocity=64, time=0),
+                mido.Message("note_on", channel=0, note=pitch, velocity=current_velocity, time=0),
             ))
         elif tok.startswith("NOTE_OFF_"):
             pitch = int(tok.split("_")[2])
             open_notes.pop(pitch, None)
             events.append((
                 current_ms,
-                mido.Message("note_off", channel=0, pitch=pitch, velocity=0, time=0),
+                mido.Message("note_off", channel=0, note=pitch, velocity=0, time=0),
             ))
         elif tok.startswith("DRUM_ON_"):
             pitch = int(tok.split("_")[2])
@@ -397,18 +419,18 @@ def decode(token_ids: List[int], ticks_per_beat: int = 480) -> mido.MidiFile:
             off_ms = current_ms + DRUM_FIXED_DURATION_MS
             events.append((
                 on_ms,
-                mido.Message("note_on", channel=9, pitch=pitch, velocity=64, time=0),
+                mido.Message("note_on", channel=9, note=pitch, velocity=current_velocity, time=0),
             ))
             events.append((
                 off_ms,
-                mido.Message("note_off", channel=9, pitch=pitch, velocity=0, time=0),
+                mido.Message("note_off", channel=9, note=pitch, velocity=0, time=0),
             ))
 
     # Close any notes that were never closed
     for pitch, on_ms in open_notes.items():
         events.append((
             current_ms,
-            mido.Message("note_off", channel=0, pitch=pitch, velocity=0, time=0),
+            mido.Message("note_off", channel=0, note=pitch, velocity=0, time=0),
         ))
 
     # Sort by abs_ms, convert to delta ticks
