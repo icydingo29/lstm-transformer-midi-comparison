@@ -132,7 +132,7 @@ venv\Scripts\activate
 # macOS / Linux
 # source venv/bin/activate
 
-pip install -U pip
+pip install -U pip # because of --extra-index-url
 pip install -r requirements.txt
 ```
 

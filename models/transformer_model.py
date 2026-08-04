@@ -115,7 +115,7 @@ class TransformerModel(nn.Module):
         embed_dim: int = 256,
         num_heads: int = 4,
         num_layers: int = 4,
-        ffn_dim: int = 1024,
+        ffn_dim: int = 1280,
         context_len: int = 512,
         dropout: float = 0.1,
         pad_id: int = 529,

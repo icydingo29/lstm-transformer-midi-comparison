@@ -53,7 +53,7 @@ def get_tokenizer(name: str):
     elif name == "remi":
         from tokenizers.remi_wrapper import REMIWrapper
         return REMIWrapper()
-    raise ValueError(name)
+    raise ValueError(f"Unknown tokenizer '{name}'")
 
 
 # ---------------------------------------------------------------------------
